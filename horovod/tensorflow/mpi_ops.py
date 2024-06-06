@@ -221,7 +221,8 @@ def allgather(tensor, name=None, ignore_name_scope=False, process_set=global_pro
         name = 'HorovodAllgather_%s' % _normalize_name(tensor.name)
     return MPI_LIB.horovod_allgather(tensor, name=name,
                                      ignore_name_scope=ignore_name_scope,
-                                     process_set_id=process_set.process_set_id)
+                                     process_set_id=process_set.process_set_id,
+                                     world_size=process_set.size())
 
 
 @ops.RegisterGradient('HorovodAllgather')
@@ -476,7 +477,8 @@ def _reducescatter(tensor, name=None, op=Sum, ignore_name_scope=False,
                                          ignore_name_scope=ignore_name_scope,
                                          process_set_id=process_set.process_set_id,
                                          prescale_factor=prescale_factor,
-                                         postscale_factor=postscale_factor)
+                                         postscale_factor=postscale_factor,
+                                         world_size=process_set.size())
 
 
 @ops.RegisterGradient('HorovodReducescatter')

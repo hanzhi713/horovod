@@ -173,6 +173,12 @@ void CustomCallConfig::ParseFromString(std::string input) {
   }
 }
 
+enum class XLACollectiveType {
+  ALLREDUCE,
+  REDUCESCATTER,
+  ALLGATHER
+};
+
 // HVDAllreduceOp is an XLAOpKernel that lowers the Tensorflow HorovodAllreduce
 // op into XLA HLOs. The overall idea is to lower an Tensorflow op into two
 // corresponding HLO custom-calls, `start` and `end` calls, so that the XLA can
@@ -182,12 +188,19 @@ void CustomCallConfig::ParseFromString(std::string input) {
 // op is lowered into the "CallbackHVDAllreduce" and "CallbackHVDAllreduceDone"
 // HLO custom-calls, whose implementations are also provided through dynamic
 // registration in this file.
+template <XLACollectiveType type>
 class HVDAllreduceOp : public XlaOpKernel {
 public:
   explicit HVDAllreduceOp(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("reduce_op", &reduce_op_));
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("prescale_factor", &prescale_factor_));
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("postscale_factor", &postscale_factor_));
+    if (type != XLACollectiveType::ALLGATHER) {
+      OP_REQUIRES_OK(ctx, ctx->GetAttr("reduce_op", &reduce_op_));
+      OP_REQUIRES_OK(ctx, ctx->GetAttr("prescale_factor", &prescale_factor_));
+      OP_REQUIRES_OK(ctx, ctx->GetAttr("postscale_factor", &postscale_factor_));
+    }
+    if (type != XLACollectiveType::ALLREDUCE) {
+      // allreduce doesn't have and doesn't need world_size attribute
+      OP_REQUIRES_OK(ctx, ctx->GetAttr("world_size", &world_size_));
+    }
     OP_REQUIRES_OK(ctx, ctx->GetAttr("ignore_name_scope", &ignore_name_scope_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("process_set_id", &process_set_id_));
   }
@@ -214,23 +227,71 @@ public:
         output_operand_aliasing = {
             {::xla::ShapeIndex{}, {0, ::xla::ShapeIndex{}}}};
     ::xla::XlaOp input = ctx->Input(0);
-    ::xla::XlaOp allreduce_start = b->ReportErrorOrReturn(
-        BuildAllreduceCustomCall(b, {input}, /*is_start=*/true));
+    ::xla::XlaOp op_start = b->ReportErrorOrReturn(
+        BuildCustomCall(b, {input}, /*is_start=*/true));
     // Then, generate HVDAllreduceDone.
-    ::xla::XlaOp allreduce_end = b->ReportErrorOrReturn(
-        BuildAllreduceCustomCall(b, {allreduce_start},
+    ::xla::XlaOp op_end = b->ReportErrorOrReturn(
+        BuildCustomCall(b, {op_start},
                                  /*is_start=*/false, output_operand_aliasing));
-    ctx->SetOutput(0, allreduce_end);
+    ctx->SetOutput(0, op_end);
     return;
   }
 
 private:
-  ::xla::StatusOr<::xla::XlaOp> BuildAllreduceCustomCall(
+  ::xla::StatusOr<::xla::XlaOp> BuildCustomCall(
       ::xla::XlaBuilder* b, absl::Span<const ::xla::XlaOp> operands,
       bool is_start,
       absl::Span<const std::pair<::xla::ShapeIndex,
                                  std::pair<int64, ::xla::ShapeIndex>>>
-          output_operand_aliasing = {});
+          output_operand_aliasing = {}) {
+    // A helper function to build HLOs for all-reduce.
+    string call_target_name = "CallbackHVD";
+    if (!is_start) {
+      call_target_name += "Done";
+    }
+    else {
+      if (type == XLACollectiveType::ALLREDUCE) call_target_name += "Allreduce";
+      else if (type == XLACollectiveType::REDUCESCATTER) call_target_name += "Reducescatter";
+      else if (type == XLACollectiveType::ALLGATHER) call_target_name += "Allgather";
+    }
+
+    CustomCallConfig config;
+    config.tensor_name_ = node_name_;
+    for (const ::xla::XlaOp& opnd : operands) {
+      TF_ASSIGN_OR_RETURN(::xla::Shape shape, b->GetShape(opnd));
+      config.input_shapes_.push_back(std::vector<int64_t>(
+          shape.dimensions().begin(), shape.dimensions().end()));
+    }
+    
+    TF_ASSIGN_OR_RETURN(::xla::Shape output_shape, b->GetShape(operands.at(0)));
+    // we may see output shape different from input shape only if is_start==true 
+    // otherwise output is just an alias of input. 
+    if (is_start) {
+      if (type == XLACollectiveType::REDUCESCATTER) {
+        output_shape.set_dimensions(0, output_shape.dimensions(0) / world_size_);
+      } else if (type == XLACollectiveType::ALLGATHER) {
+        output_shape.set_dimensions(0, output_shape.dimensions(0) * world_size_);
+      }
+    }
+    config.output_shapes_.push_back(std::vector<int64_t>(
+          output_shape.dimensions().begin(), output_shape.dimensions().end()));
+
+    config.tensor_type_ = GetHVDType(output_shape.element_type());
+    if (type != XLACollectiveType::ALLGATHER) {
+      config.prescale_factor_ = prescale_factor_;
+      config.postscale_factor_ = postscale_factor_;
+      config.reduce_op_ = reduce_op_;
+    }
+    config.process_set_id_ = process_set_id_;
+
+    return ::xla::CustomCall(
+        b, call_target_name, operands, output_shape, config.SerializeToString(),
+        /*has_side_effect=*/false, output_operand_aliasing, /*literal=*/nullptr,
+        // Special schedule hints are given so that XLA knows how to schedule
+        // the opague custom-calls for performance.
+        is_start ? ::xla::CustomCallSchedule::SCHEDULE_EARLIEST
+                : ::xla::CustomCallSchedule::SCHEDULE_LATEST);
+  }
 
 private:
   std::string node_name_;
@@ -240,6 +301,7 @@ private:
   float postscale_factor_;
   bool ignore_name_scope_;
   int process_set_id_;
+  int world_size_;
 };
 
 // Implements a customized registrar so that the registration is an opt-in,
@@ -271,41 +333,9 @@ private:
   XlaOpRegistrar* xla_op_registrar_;
 };
 
-HVD_REGISTER_XLA_OP("HorovodAllreduce", HVDAllreduceOp);
-
-// A helper function to build HLOs for all-reduce.
-::xla::StatusOr<::xla::XlaOp> HVDAllreduceOp::BuildAllreduceCustomCall(
-    ::xla::XlaBuilder* b, absl::Span<const ::xla::XlaOp> operands,
-    bool is_start,
-    absl::Span<
-        const std::pair<::xla::ShapeIndex, std::pair<int64, ::xla::ShapeIndex>>>
-        output_operand_aliasing) {
-  string call_target_name =
-      is_start ? "CallbackHVDAllreduce" : "CallbackHVDAllreduceDone";
-  CustomCallConfig config;
-  config.tensor_name_ = node_name_;
-  for (const ::xla::XlaOp& opnd : operands) {
-    TF_ASSIGN_OR_RETURN(::xla::Shape shape, b->GetShape(opnd));
-    config.input_shapes_.push_back(std::vector<int64_t>(
-        shape.dimensions().begin(), shape.dimensions().end()));
-  }
-  TF_ASSIGN_OR_RETURN(::xla::Shape output_shape, b->GetShape(operands.at(0)));
-  config.output_shapes_.push_back(std::vector<int64_t>(
-      output_shape.dimensions().begin(), output_shape.dimensions().end()));
-  config.tensor_type_ = GetHVDType(output_shape.element_type());
-  config.prescale_factor_ = prescale_factor_;
-  config.postscale_factor_ = postscale_factor_;
-  config.reduce_op_ = reduce_op_;
-  config.process_set_id_ = process_set_id_;
-
-  return ::xla::CustomCall(
-      b, call_target_name, operands, output_shape, config.SerializeToString(),
-      /*has_side_effect=*/false, output_operand_aliasing, /*literal=*/nullptr,
-      // Special schedule hints are given so that XLA knows how to schedule
-      // the opague custom-calls for performance.
-      is_start ? ::xla::CustomCallSchedule::SCHEDULE_EARLIEST
-               : ::xla::CustomCallSchedule::SCHEDULE_LATEST);
-}
+HVD_REGISTER_XLA_OP("HorovodAllreduce", HVDAllreduceOp<XLACollectiveType::ALLREDUCE>);
+HVD_REGISTER_XLA_OP("HorovodReducescatter", HVDAllreduceOp<XLACollectiveType::REDUCESCATTER>);
+// HVD_REGISTER_XLA_OP("HorovodAllgather", HVDAllreduceOp<XLACollectiveType::ALLGATHER>);
 
 // Returns a hash for rendezvous.
 uint64 GetRendezvousKeyHash(const string& key) {
@@ -462,7 +492,7 @@ protected:
 
 class XLAOpContext : public common::OpContext {
 public:
-  XLAOpContext(int device) : device_(device) {}
+  XLAOpContext(int device, std::shared_ptr<common::Tensor> output = nullptr) : device_(device), output_(output) {}
 
   virtual common::Status AllocatePersistent(
       int64_t size, std::shared_ptr<common::PersistentBuffer>* tensor) override;
@@ -482,6 +512,7 @@ public:
 
 private:
   int device_;
+  std::shared_ptr<common::Tensor> output_;
 };
 
 class XLAPersistentBuffer : public common::PersistentBuffer {
@@ -528,6 +559,13 @@ common::Status
 XLAOpContext::AllocateOutput(common::TensorShape shape,
                              std::shared_ptr<common::Tensor>* tensor,
                              std::shared_ptr<common::ReadyEvent>* event) {
+  if (output_.get() != nullptr) {
+    CHECK(output_->shape() == shape) << "shape mismatch";
+    *tensor = output_;
+    // we leave event as nullptr so NCCLAllgather::AllocateOutput
+    // won't wait for it. 
+    return common::Status::OK();
+  }
   // XLA must manage I/O buffers.
   return common::Status::PreconditionError(
       "AllocateOutput is not supported for XLA.");
@@ -556,8 +594,9 @@ int GetDeviceOrdinal(void* ptr) {
 }
 
 // Implements for the `HVDAllreduce` HLO CustomCall.
-void CallbackHVDAllreduce(gpuStream_t stream, void** buffers, const char* opaque,
-                          size_t opaque_len) {
+template <XLACollectiveType type>
+void CallbackHVD(gpuStream_t stream, void** buffers, const char* opaque,
+                 size_t opaque_len) {
   CHECK(common::CheckInitialized().ok());
   CustomCallConfig config;
   config.ParseFromString(std::string(opaque, opaque_len));
@@ -567,41 +606,80 @@ void CallbackHVDAllreduce(gpuStream_t stream, void** buffers, const char* opaque
   ready_event_list.AddReadyEvent(
       std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(stream)));
   int dev_ordinal = GetDeviceOrdinal(buffers[0]);
-  auto hvd_context = std::make_shared<XLAOpContext>(dev_ordinal);
+  auto hvd_output = std::make_shared<XLATensor>(
+      config.tensor_type_, common::TensorShape(config.output_shapes_[0]),
+      buffers[1]);
+  std::shared_ptr<XLAOpContext> hvd_context;
+  if (type != XLACollectiveType::ALLGATHER) {
+    hvd_context = std::make_shared<XLAOpContext>(dev_ordinal);
+  } else {
+    // allgather allocates output from the context. 
+    // hack this by passing the output in
+    hvd_context = std::make_shared<XLAOpContext>(dev_ordinal, hvd_output);
+  }
   auto hvd_input = std::make_shared<XLATensor>(
       config.tensor_type_, common::TensorShape(config.input_shapes_[0]),
       buffers[0]);
-  auto hvd_output = std::make_shared<XLATensor>(
-      config.tensor_type_, common::TensorShape(config.input_shapes_[0]),
-      buffers[1]);
-  common::Status enqueue_result = EnqueueTensorAllreduce(
+  common::Status enqueue_result;
+  auto callback = [=](const common::Status& status) {
+    // When request is done processing, signal `HVDAllreduceDone`.
+    CHECK(status.ok()) << status.reason();
+    // std::cerr << "signaling for " << config.tensor_name_ << std::endl;
+    GetHVDCustomCallRendezvous()->Signal(config.tensor_name_, status.event);
+  };
+  if (type == XLACollectiveType::ALLREDUCE) {
+    enqueue_result = EnqueueTensorAllreduce(
       hvd_context, hvd_input, hvd_output, ready_event_list, config.tensor_name_,
-      dev_ordinal,
-      [=](const common::Status& status) {
-        // When request is done processing, signal `HVDAllreduceDone`.
-        CHECK(status.ok()) << status.reason();
-        GetHVDCustomCallRendezvous()->Signal(config.tensor_name_, status.event);
-      },
+      dev_ordinal, callback,
       (horovod::common::ReduceOp)config.reduce_op_,
       (double)config.prescale_factor_, (double)config.postscale_factor_,
       config.process_set_id_);
+  } else if (type == XLACollectiveType::REDUCESCATTER) {
+    // note the position of parameter "process_set_id" is different from above
+    enqueue_result = EnqueueTensorReducescatter(
+      hvd_context, hvd_input, hvd_output, ready_event_list, config.tensor_name_,
+      dev_ordinal, callback,
+      (horovod::common::ReduceOp)config.reduce_op_, config.process_set_id_,
+      (double)config.prescale_factor_, (double)config.postscale_factor_);
+  } else if (type == XLACollectiveType::ALLGATHER) {
+    enqueue_result = EnqueueTensorAllgather(
+      hvd_context, hvd_input, ready_event_list, config.tensor_name_,
+      dev_ordinal, callback, config.process_set_id_);
+  }
   CHECK(enqueue_result.ok()) << enqueue_result.reason();
 }
 
 // Implements for the `HVDAllreduceDone` HLO CustomCall.
-void CallbackHVDAllreduceDone(gpuStream_t stream, void** /*buffers*/,
-                              const char* opaque, size_t opaque_len) {
+void CallbackHVDDone(gpuStream_t stream, void** /*buffers*/,
+                     const char* opaque, size_t opaque_len) {
   // Blocking until the request is done processing by the Horovod runtime.
-  VLOG(2) << "hvd-allreduce-done - Start";
   CustomCallConfig config;
   config.ParseFromString(std::string(opaque, opaque_len));
+  // std::cerr << "hvd-done start " << config.tensor_name_ << std::endl;
   GetHVDCustomCallRendezvous()->Wait(config.tensor_name_, stream);
-  VLOG(2) << "hvd-allreduce-done - End";
+  // std::cerr << "hvd-done end " << config.tensor_name_ << std::endl;
+}
+
+void CallbackHVDAllreduce(gpuStream_t stream, void** buffers, const char* opaque,
+                          size_t opaque_len) {
+  CallbackHVD<XLACollectiveType::ALLREDUCE>(stream, buffers, opaque, opaque_len);
+}
+
+void CallbackHVDReducescatter(gpuStream_t stream, void** buffers, const char* opaque,
+                              size_t opaque_len) {
+  CallbackHVD<XLACollectiveType::REDUCESCATTER>(stream, buffers, opaque, opaque_len);
+}
+
+void CallbackHVDAllgather(gpuStream_t stream, void** buffers, const char* opaque,
+                              size_t opaque_len) {
+  CallbackHVD<XLACollectiveType::ALLGATHER>(stream, buffers, opaque, opaque_len);
 }
 
 #if HAVE_CUDA
 XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDAllreduce, "CUDA");
-XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDAllreduceDone, "CUDA");
+XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDReducescatter, "CUDA");
+XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDAllgather, "CUDA");
+XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDDone, "CUDA");
 #elif HAVE_ROCM
 XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDAllreduce, "ROCM");
 XLA_REGISTER_CUSTOM_CALL_TARGET(CallbackHVDAllreduceDone, "ROCM");

@@ -759,20 +759,59 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAllgather").Device(DEVICE_GPU),
                         HorovodAllgatherOp);
 #endif
 
+template <bool is_allgather>
+Status AllgatherReducescatterShapeFn(shape_inference::InferenceContext* c) {
+  // Get the input shape handle for the first (or only) input tensor.
+  // Also ensure that input has at least one dimension
+  shape_inference::ShapeHandle input_shape;
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 1, &input_shape)); 
+
+  // Get the "world_size" attribute.
+  int world_size;
+  TF_RETURN_IF_ERROR(c->GetAttr("world_size", &world_size));
+
+  if (world_size == -1) {
+    shape_inference::ShapeHandle output;
+    TF_RETURN_IF_ERROR(
+        c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
+    c->set_output(0, output);
+    return Status();
+  }
+
+  // Get the first dimension of the input shape.
+  auto input_first_dim = c->Dim(input_shape, 0);
+
+  // Multiply the first dimension of the input by the "world_size".
+  shape_inference::DimensionHandle output_first_dim;
+  if (is_allgather) {
+    TF_RETURN_IF_ERROR(c->Multiply(input_first_dim, world_size, &output_first_dim));
+  } else {
+    TF_RETURN_IF_ERROR(c->Divide(input_first_dim, world_size, true, &output_first_dim));
+  }
+
+  // Build the output shape, replacing the first dimension with the one multiplied by "world_size".
+  std::vector<shape_inference::DimensionHandle> dims;
+  dims.push_back(output_first_dim); // Push the new first dimension.
+
+  // Copy the remaining dimensions from the original input tensor.
+  for (int i = 1; i < c->Rank(input_shape); ++i) {
+    dims.push_back(c->Dim(input_shape, i));
+  }
+  c->set_output(0, c->MakeShape(dims));
+
+  // Return a status of success.
+  return Status();
+}
+
 REGISTER_OP("HorovodAllgather")
     .Attr(
         "T: {uint8, int8, uint16, int16, int32, int64, float16, float32, float64, bool}")
     .Attr("ignore_name_scope: bool = False")
     .Attr("process_set_id: int = 0")
+    .Attr("world_size: int = -1")
     .Input("tensor: T")
     .Output("output: T")
-    .SetShapeFn([](shape_inference::InferenceContext* c) {
-      shape_inference::ShapeHandle output;
-      TF_RETURN_IF_ERROR(
-          c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
-      c->set_output(0, output);
-      return Status();
-    })
+    .SetShapeFn(AllgatherReducescatterShapeFn<true>)
     .Doc(R"doc(
 Perform an Allgather on a tensor. All other processes that do a gather on a
 tensor with the same name must have the same rank for that tensor, and have the
@@ -1382,21 +1421,10 @@ REGISTER_OP("HorovodReducescatter")
     .Attr("prescale_factor: float")
     .Attr("postscale_factor: float")
     .Attr("process_set_id: int = 0")
+    .Attr("world_size: int = -1")
     .Input("tensor: T")
     .Output("output: T")
-    .SetShapeFn([](shape_inference::InferenceContext* c) {
-      if (shape_inference::InferenceContext::Rank(c->input(0)) == 0) {
-        return errors::InvalidArgument(
-            "HorovodReducescatter does not support scalar inputs.");
-      }
-      // Output shape is unknown before Horovod initialization (need to know
-      // process set size).
-      shape_inference::ShapeHandle output;
-      TF_RETURN_IF_ERROR(
-          c->ReplaceDim(c->input(0), 0, c->UnknownDim(), &output));
-      c->set_output(0, output);
-      return Status();
-    })
+    .SetShapeFn(AllgatherReducescatterShapeFn<false>)
     .Doc(R"doc(
 Perform a Reducescatter on a tensor. All other processes that do a
 reduce scatter on a tensor with the same name must have the same shape for
