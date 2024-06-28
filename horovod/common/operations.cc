@@ -1904,6 +1904,7 @@ EnqueueTensorReducescatters(std::vector<std::shared_ptr<OpContext>>& contexts,
 Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
                              std::shared_ptr<Tensor> tensor,
                              std::shared_ptr<Tensor> splits,
+                             std::shared_ptr<Tensor> recv_splits,
                              ReadyEventList ready_event_list,
                              const std::string& name, const int device,
                              StatusCallback callback, int32_t process_set_id) {
@@ -1929,6 +1930,19 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
     return Status::InvalidArgument(
         "alltoall expects splits to contain 32-bit integer elements.");
   }
+  if (recv_splits != nullptr) {
+    if (recv_splits->shape().dims() > 1) {
+      return Status::InvalidArgument("alltoall expects a 1D recv_splits tensor");
+    }
+    if (recv_splits->dtype() != HOROVOD_INT32) {
+      return Status::InvalidArgument(
+          "alltoall expects recv_splits to contain 32-bit integer elements.");
+    }
+    if (recv_splits->size() != splits->size()) {
+      return Status::InvalidArgument(
+          "if recv_splits is specified, alltoall expects recv_splits.size() == splits.size()");
+    }
+  }
 
   Request message;
   message.set_request_rank(process_set.controller->GetRank());
@@ -1949,6 +1963,7 @@ Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
   e.device = device;
   e.callback = callback;
   e.nvtx_op_range.Start(RegisteredNvtxOp::HorovodAlltoall, e.tensor->size());
+  e.received_splits = recv_splits;
 
   int64_t splits_first_dim = splits->shape().dim_size(0);
   int64_t tensor_first_dim = tensor->shape().dim_size(0);

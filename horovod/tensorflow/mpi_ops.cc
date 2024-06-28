@@ -379,7 +379,7 @@ TFOpContext::AllocateOutput(int output_index, common::TensorShape shape,
   // On GPU allocation is asynchronous, we need to wait for it to
   // complete.
   auto device_context = context_->op_device_context();
-  if (device_context != nullptr) {
+  if (device_context != nullptr && context_->output_memory_type(output_index) != HOST_MEMORY) {
     if (event == nullptr) {
       auto status_gpu = device_context->stream()->BlockHostUntilDone();
       if (!status_gpu.ok()) {
@@ -1882,6 +1882,7 @@ public:
     auto device = GetDeviceID(context);
     auto tensor = context->input(0);
     auto splits = context->input(1);
+    auto recv_splits = context->input(2);
     common::ReadyEventList ready_event_list;
 #if HAVE_GPU
     ready_event_list.AddReadyEvent(std::shared_ptr<common::ReadyEvent>(RecordReadyEvent(context)));
@@ -1889,8 +1890,12 @@ public:
     auto hvd_context = std::make_shared<TFOpContext>(context);
     auto hvd_tensor = std::make_shared<TFTensor>(tensor);
     auto splits_tensor = std::make_shared<TFTensor>(splits);
+    std::shared_ptr<TFTensor> recv_splits_tensor;
+    if (recv_splits.NumElements() > 0) {
+      recv_splits_tensor = std::make_shared<TFTensor>(recv_splits);
+    }
     auto enqueue_result = EnqueueTensorAlltoall(
-        hvd_context, hvd_tensor, splits_tensor, ready_event_list, node_name, device,
+        hvd_context, hvd_tensor, splits_tensor, recv_splits_tensor, ready_event_list, node_name, device,
         [context, done](const common::Status& status) {
 #if HAVE_GPU
           auto hvd_event = status.event;
@@ -1919,6 +1924,7 @@ REGISTER_KERNEL_BUILDER(Name("HorovodAlltoall").Device(DEVICE_CPU),
 REGISTER_KERNEL_BUILDER(Name("HorovodAlltoall")
                             .Device(DEVICE_GPU)
                             .HostMemory("splits")
+                            .HostMemory("recv_splits")
                             .HostMemory("received_splits"),
                         HorovodAlltoallOp);
 #endif
@@ -1930,6 +1936,7 @@ REGISTER_OP("HorovodAlltoall")
     .Attr("process_set_id: int = 0")
     .Input("tensor: T")
     .Input("splits: int32")
+    .Input("recv_splits: int32")
     .Output("output: T")
     .Output("received_splits: int32")
     .SetShapeFn([](shape_inference::InferenceContext* c) {

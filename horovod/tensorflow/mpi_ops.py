@@ -394,7 +394,7 @@ def broadcast_(variables, root_rank, name=None, process_set=global_process_set):
         raise ValueError("All variables passed to broadcast_() should be of the same kind, resource or reference")
 
 
-def alltoall(tensor, splits=None, name=None, ignore_name_scope=False, process_set=global_process_set):
+def alltoall(tensor, splits=None, recv_splits=None, name=None, ignore_name_scope=False, process_set=global_process_set):
     """An op that scatters slices of the input tensor to all other Horovod processes
     and returns a tensor of gathered slices from all other Horovod processes.
 
@@ -424,11 +424,11 @@ def alltoall(tensor, splits=None, name=None, ignore_name_scope=False, process_se
     """
     # If splits not provided, create empty tensor as placeholder
     splits_ = tf.convert_to_tensor(splits) if splits is not None else tf.constant([], dtype=tf.int32)
-
+    recv_splits_ = tf.convert_to_tensor(recv_splits) if recv_splits is not None else tf.constant([], dtype=tf.int32)
     if name is None and not _executing_eagerly():
         name = 'HorovodAlltoall_%s' % _normalize_name(tensor.name)
-    output, rsplits = MPI_LIB.horovod_alltoall(tensor, splits=splits_, name=name,
-                                               ignore_name_scope=ignore_name_scope,
+    output, rsplits = MPI_LIB.horovod_alltoall(tensor, splits=splits_, recv_splits=recv_splits_,
+                                               name=name, ignore_name_scope=ignore_name_scope,
                                                process_set_id=process_set.process_set_id)
     return (output, rsplits) if splits is not None else output
 

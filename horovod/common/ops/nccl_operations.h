@@ -145,9 +145,17 @@ protected:
     auto world_size = process_set.controller->GetSize();
 
     const auto& splits = e.splits;
-    std::vector<int32_t> recvsplits;
-
-    process_set.controller->AlltoallGetRecvSplits(splits, recvsplits);
+    const int32_t* recvsplits;
+    std::vector<int32_t> recvsplits_store;
+    if (e.received_splits == nullptr) {
+      // auto start_t = std::chrono::steady_clock::now();
+      process_set.controller->AlltoallGetRecvSplits(splits, recvsplits_store);
+      recvsplits = recvsplits_store.data();
+      // auto duration = (std::chrono::steady_clock::now() - start_t).count() * 1e-6;
+      // std::cerr << "alltoall time " << duration << std::endl;
+    } else {
+      recvsplits = (const int32_t*)e.received_splits->data();
+    }
 
     // Every tensor participating in Alltoall operation may have different
     // first dimension size, but the rest of dimensions are same for all
@@ -195,9 +203,13 @@ protected:
       HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, event->event(), 0));
     }
 
+    // if we passed in recv splits, this will be already be allocated
+    if (e.received_splits != nullptr)
+      return Status::OK();
+
     // Allocate and fill received_splits output
     TensorShape received_splits_shape;
-    received_splits_shape.AddDim(recvsplits.size());
+    received_splits_shape.AddDim(world_size);
 
     std::shared_ptr<ReadyEvent> revent;
     Status rstatus = e.context->AllocateOutput(1, received_splits_shape,
@@ -211,13 +223,13 @@ protected:
     }
 
     // Add event dependency for received_splits allocation to stream
-    if (revent) {
+    if (revent) { // should be nullptr since it's on host memory for tf
       HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, revent->event(), 0));
     }
 
     auto* target_pointer = reinterpret_cast<int32_t*>(
         const_cast<void*>(e.received_splits->data()));
-    std::copy(recvsplits.cbegin(), recvsplits.cend(), target_pointer);
+    std::copy(recvsplits, recvsplits + world_size, target_pointer);
 
     return Status::OK();
   }

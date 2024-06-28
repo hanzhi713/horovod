@@ -337,7 +337,7 @@ private:
 
 HVD_REGISTER_XLA_OP("HorovodAllreduce", HVDAllreduceOp<XLACollectiveType::ALLREDUCE>);
 HVD_REGISTER_XLA_OP("HorovodReducescatter", HVDAllreduceOp<XLACollectiveType::REDUCESCATTER>);
-// HVD_REGISTER_XLA_OP("HorovodAllgather", HVDAllreduceOp<XLACollectiveType::ALLGATHER>);
+HVD_REGISTER_XLA_OP("HorovodAllgather", HVDAllreduceOp<XLACollectiveType::ALLGATHER>);
 
 // Returns a hash for rendezvous.
 uint64 GetRendezvousKeyHash(const string& key) {
@@ -649,6 +649,7 @@ void CallbackHVD(gpuStream_t stream, void** buffers, const char* opaque,
       dev_ordinal, callback, config.process_set_id_);
   }
   CHECK(enqueue_result.ok()) << enqueue_result.reason();
+  // std::cerr << "enqueuing for " << config.tensor_name_ << std::endl;
 }
 
 // Implements for the `HVDAllreduceDone` HLO CustomCall.
